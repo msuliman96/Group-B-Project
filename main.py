@@ -11,6 +11,21 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import train_test_split
 
 # ---------------------------
+# HELPER FUNCTIONS
+# ---------------------------
+def get_float(val):
+    """Safely extract a float from a value, even if it's a one-element Series."""
+    if isinstance(val, pd.Series):
+        return float(val.iloc[0])
+    return float(val)
+
+def get_date(val):
+    """Safely extract a datetime value from a value, even if it's a one-element Series."""
+    if isinstance(val, pd.Series):
+        return val.iloc[0]
+    return val
+
+# ---------------------------
 # TECHNICAL INDICATOR FUNCTIONS
 # ---------------------------
 def compute_SMA(series, window):
@@ -47,7 +62,6 @@ def fetch_data(ticker, start_date, end_date):
     return df
 
 def compute_indicators(df, indicators):
-    # Compute indicators using the 'Close' price
     if indicators.get("SMA50"):
         df["SMA50"] = compute_SMA(df["Close"], 50)
     if indicators.get("SMA200"):
@@ -62,16 +76,9 @@ def compute_indicators(df, indicators):
     return df
 
 def prepare_ml_data(df, lookahead):
-    """
-    Create a target column where:
-      - 1 (BUY): if the price increases in the next `lookahead` days
-      - 0 (SELL): if the price decreases in the next `lookahead` days
-    """
     df = df.copy()
-    # Ensure 'Close' is a 1D Series
     df["Close"] = df["Close"].squeeze()
     df["Future_Close"] = df["Close"].shift(-lookahead)
-    # Flatten the arrays to ensure they are 1D
     close_arr = df["Close"].to_numpy().flatten()
     future_arr = df["Future_Close"].to_numpy().flatten()
     df["Target"] = np.where(future_arr > close_arr, 1, 0)
@@ -79,9 +86,6 @@ def prepare_ml_data(df, lookahead):
     return df
 
 def select_features(df, indicators):
-    """
-    Select technical indicator columns (and Close) as features.
-    """
     feature_cols = []
     if indicators.get("SMA50"):
         feature_cols.append("SMA50")
@@ -91,12 +95,9 @@ def select_features(df, indicators):
         feature_cols.append("RSI")
     if indicators.get("MACD"):
         feature_cols.append("MACD")
-        # Optionally include the signal line:
-        # feature_cols.append("MACD_signal")
     if indicators.get("Bollinger"):
         feature_cols.append("BB_upper")
         feature_cols.append("BB_lower")
-    # It's often useful to include the closing price as well.
     feature_cols.append("Close")
     
     X = df[feature_cols]
@@ -107,7 +108,8 @@ def select_features(df, indicators):
 # MACHINE LEARNING FUNCTIONS
 # ---------------------------
 def train_xgb_model(X_train, y_train):
-    model = XGBClassifier(n_estimators=100, learning_rate=0.05, use_label_encoder=False, eval_metric="logloss")
+    # Removed use_label_encoder to avoid warning; eval_metric is set explicitly.
+    model = XGBClassifier(n_estimators=100, learning_rate=0.05, eval_metric="logloss")
     model.fit(X_train, y_train)
     return model
 
@@ -119,6 +121,13 @@ def evaluate_model(model, X_test, y_test):
     return acc, class_report, cm, y_pred
 
 def plot_confusion_matrix(cm):
+    # Check if confusion matrix is empty
+    if cm.size == 0:
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, "No Data", horizontalalignment='center', verticalalignment='center', fontsize=12)
+        ax.set_title("Confusion Matrix")
+        ax.axis("off")
+        return fig
     fig, ax = plt.subplots()
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
     ax.set_xlabel("Predicted")
@@ -137,45 +146,35 @@ def plot_feature_importance(model, feature_names):
     return fig
 
 # ---------------------------
-# BACKTESTING & BUY & HOLD COMPARISON
+# WALK-FORWARD BACKTESTING
 # ---------------------------
-def backtest_strategy(df, model, feature_cols):
-    """
-    Simulate trading with your strategy and also compute a Buy & Hold portfolio.
-    
-    Trading Rules:
-      - Start with $10,000.
-      - On a BUY signal (model predicts 1) with no open position, buy as many shares as possible.
-      - On a SELL signal (model predicts 0) with an open position, sell all shares.
-      - All trades are executed at the market close price.
-      - At the end, if a position is open, sell at the last available price.
-      
-    Buy & Hold:
-      - Buy as many shares as possible on the first day and hold until the end.
-    
-    Returns:
-      trade_log_df: DataFrame with trade log details.
-      portfolio_df: Daily portfolio values for your strategy.
-      buy_hold_df: Daily portfolio values for a Buy & Hold strategy.
-    """
+def walk_forward_backtest_strategy(df, indicators, feature_cols):
     initial_balance = 10000
     balance = initial_balance
     position = 0
     trade_log = []
     portfolio_values = []
-    
-    # Loop over each day for strategy simulation
-    for idx, row in df.iterrows():
-        # Get current price and date as scalars
-        current_price = float(row["Close"]) if not isinstance(row["Close"], pd.Series) else float(row["Close"].iloc[0])
-        date = row["Date"] if not isinstance(row["Date"], pd.Series) else row["Date"].iloc[0]
-        
-        # Prepare feature vector and get model prediction
-        X_day = row[feature_cols].values.reshape(1, -1)
-        prediction = model.predict(X_day)[0]
+
+    # Use the first 80% of the data as the initial training window.
+    train_window = int(len(df) * 0.8)
+
+    # Walk-forward simulation: retrain the model each day using only past data.
+    for idx in range(train_window, len(df)):
+        df_train = df.iloc[:idx]
+        test_row = df.iloc[idx:idx+1]
+
+        X_train, y_train, _ = select_features(df_train, indicators)
+        X_test, _, _ = select_features(test_row, indicators)
+
+        model_loop = train_xgb_model(X_train, y_train)
+
+        row = test_row.iloc[0]
+        current_price = get_float(row["Close"])
+        date = get_date(row["Date"])
+        prediction = model_loop.predict(X_test)[0]
         action = None
-        
-        # BUY: if prediction is 1 and no open position
+
+        # BUY signal when prediction is 1 and no current position.
         if prediction == 1 and position == 0:
             shares_to_buy = int(balance // current_price)
             if shares_to_buy > 0:
@@ -189,7 +188,7 @@ def backtest_strategy(df, model, feature_cols):
                     "Shares": shares_to_buy,
                     "Portfolio Value": balance + position * current_price
                 })
-        # SELL: if prediction is 0 and a position is held
+        # SELL signal when prediction is 0 and a position is held.
         elif prediction == 0 and position > 0:
             balance += position * current_price
             action = "SELL"
@@ -201,8 +200,7 @@ def backtest_strategy(df, model, feature_cols):
                 "Portfolio Value": balance
             })
             position = 0
-        
-        # Record the portfolio value for the day (cash + value of held shares)
+
         portfolio_value = balance + position * current_price
         portfolio_values.append({
             "Date": date,
@@ -211,12 +209,12 @@ def backtest_strategy(df, model, feature_cols):
             "Signal": prediction,
             "Action": action if action is not None else ""
         })
-    
-    # Close any open position on the final day
+
+    # Close any open position on the final day.
     if position > 0:
         final_row = df.iloc[-1]
-        final_price = float(final_row["Close"]) if not isinstance(final_row["Close"], pd.Series) else float(final_row["Close"].iloc[0])
-        final_date = final_row["Date"] if not isinstance(final_row["Date"], pd.Series) else final_row["Date"].iloc[0]
+        final_price = get_float(final_row["Close"])
+        final_date = get_date(final_row["Date"])
         balance += position * final_price
         trade_log.append({
             "Date": final_date,
@@ -226,31 +224,31 @@ def backtest_strategy(df, model, feature_cols):
             "Portfolio Value": balance
         })
         position = 0
-        portfolio_values[-1]["Portfolio Value"] = balance
-        portfolio_values[-1]["Action"] = "SELL (Final)"
-    
+
     trade_log_df = pd.DataFrame(trade_log)
     portfolio_df = pd.DataFrame(portfolio_values)
-    portfolio_df["Date"] = portfolio_df["Date"].apply(lambda d: pd.to_datetime(d) if not isinstance(d, pd.Timestamp) else d)
-    
-    # --- Calculate Buy & Hold Portfolio ---
-    first_row = df.iloc[0]
-    initial_price = float(first_row["Close"]) if not isinstance(first_row["Close"], pd.Series) else float(first_row["Close"].iloc[0])
+    # Ensure the Date column is in datetime format
+    portfolio_df["Date"] = pd.to_datetime(portfolio_df["Date"])
+
+    # --- Buy & Hold Simulation ---
+    first_test_row = df.iloc[train_window]
+    initial_price = get_float(first_test_row["Close"])
     shares_bought = int(initial_balance // initial_price)
     cash_left = initial_balance - shares_bought * initial_price
-    
+
     buy_hold_values = []
-    for idx, row in df.iterrows():
-        current_price = float(row["Close"]) if not isinstance(row["Close"], pd.Series) else float(row["Close"].iloc[0])
-        date = row["Date"] if not isinstance(row["Date"], pd.Series) else row["Date"].iloc[0]
+    for idx in range(train_window, len(df)):
+        row = df.iloc[idx]
+        current_price = get_float(row["Close"])
+        date = get_date(row["Date"])
         portfolio_value = shares_bought * current_price + cash_left
         buy_hold_values.append({
             "Date": date,
             "BuyHold": portfolio_value
         })
     buy_hold_df = pd.DataFrame(buy_hold_values)
-    buy_hold_df["Date"] = buy_hold_df["Date"].apply(lambda d: pd.to_datetime(d) if not isinstance(d, pd.Timestamp) else d)
-    
+    buy_hold_df["Date"] = pd.to_datetime(buy_hold_df["Date"])
+
     return trade_log_df, portfolio_df, buy_hold_df
 
 # ---------------------------
@@ -259,8 +257,8 @@ def backtest_strategy(df, model, feature_cols):
 def main():
     st.title("XGBoost Trading Strategy vs. Buy & Hold")
     st.markdown("""
-    This app implements an XGBoost-based trading strategy and compares it to a simple Buy & Hold approach.
-    Explore the trade log, portfolio equity curves, and combined comparisons below.
+    This app implements a walk-forward XGBoost-based trading strategy and compares it to a simple Buy & Hold approach.
+    The model is retrained using only past data to avoid lookahead bias.
     """)
 
     st.sidebar.header("User Input Parameters")
@@ -268,7 +266,7 @@ def main():
     start_date = st.sidebar.date_input("Start Date", value=datetime.date(2020, 1, 1))
     end_date = st.sidebar.date_input("End Date", value=datetime.date.today())
     lookahead = st.sidebar.selectbox("Lookahead Period (Days)", options=[3, 5, 10], index=1)
-    
+
     st.sidebar.subheader("Technical Indicators")
     indicators = {
         "SMA50": st.sidebar.checkbox("Simple Moving Average (50)", value=True),
@@ -277,38 +275,47 @@ def main():
         "MACD": st.sidebar.checkbox("MACD", value=True),
         "Bollinger": st.sidebar.checkbox("Bollinger Bands", value=True)
     }
-    
+
     if ticker and start_date and end_date:
-        # Fetch historical data
-        df = yf.download(ticker, start=start_date, end=end_date)
+        df = fetch_data(ticker, start_date, end_date)
         if df.empty:
             st.error("No data found for the ticker and date range provided.")
             return
-        df.reset_index(inplace=True)
+        # 'fetch_data' already resets the index; we convert the Date column to datetime.
         df["Date"] = pd.to_datetime(df["Date"])
-        
-        # Compute technical indicators
         df = compute_indicators(df, indicators)
-        
-        # Prepare data for ML
         df_ml = prepare_ml_data(df, lookahead)
+
+        # For an initial snapshot evaluation, split data into train/test (80%/20% split).
         X, y, feature_cols = select_features(df_ml, indicators)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-        
-        st.subheader("Training XGBoost Model")
+        train_size = int(0.8 * len(df_ml))
+        X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
+        y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
         model = train_xgb_model(X_train, y_train)
-        acc, class_report, cm, y_pred = evaluate_model(model, X_test, y_test)
-        st.write("**Model Accuracy:**", np.round(acc, 4))
-        st.text(classification_report(y_test, y_pred))
-        st.pyplot(plot_confusion_matrix(cm))
-        st.pyplot(plot_feature_importance(model, feature_cols))
         
-        st.subheader("Backtesting & Buy & Hold Comparison")
-        trade_log_df, portfolio_df, buy_hold_df = backtest_strategy(df_ml, model, feature_cols)
+        # Only evaluate if test data exists.
+        if X_test.empty or y_test.empty:
+            st.write("Not enough test data for evaluation. Please adjust the date range.")
+        else:
+            acc, class_report, cm, y_pred = evaluate_model(model, X_test, y_test)
+            
+            # Display larger accuracy score
+            st.markdown(f"<h2>Model Accuracy: {np.round(acc, 4)}</h2>", unsafe_allow_html=True)
+            
+            # Display classification report as a table
+            report_df = pd.DataFrame(class_report).transpose().round(4)
+            st.subheader("Classification Report")
+            st.table(report_df)
+            
+            st.pyplot(plot_confusion_matrix(cm))
+            st.pyplot(plot_feature_importance(model, feature_cols))
+
+        st.subheader("Walk-Forward Backtesting & Buy & Hold Comparison")
+        trade_log_df, portfolio_df, buy_hold_df = walk_forward_backtest_strategy(df_ml, indicators, feature_cols)
         
         st.write("### Trade Log")
         st.dataframe(trade_log_df)
-        
+
         # Plot Strategy Equity Curve
         fig_strategy, ax_strategy = plt.subplots(figsize=(10, 5))
         ax_strategy.plot(portfolio_df["Date"], portfolio_df["Portfolio Value"], label="Strategy Portfolio", color="blue")
@@ -355,7 +362,7 @@ def main():
         st.subheader("Real-Time Prediction on Latest Data")
         if st.button("Run Prediction on Most Recent Data Point"):
             latest_row = df_ml.iloc[[-1]]
-            X_latest = latest_row[feature_cols]
+            X_latest, _, _ = select_features(latest_row, indicators)
             pred = model.predict(X_latest)[0]
             signal = "BUY" if pred == 1 else "SELL"
             st.write(f"The model signals a **{signal}** at the latest close price of ${latest_row['Close'].values[0]:.2f}")
