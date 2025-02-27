@@ -8,7 +8,6 @@ import streamlit as st
 from scipy import stats
 
 from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 
@@ -119,25 +118,27 @@ def fetch_data(ticker, start_date, end_date):
     df.reset_index(inplace=True)
     return df
 
-def compute_indicators(df, indicators):
-    if indicators.get("Bollinger"):
-        df["BB_upper"], df["BB_lower"] = compute_Bollinger_Bands(df["Close"])
-    if indicators.get("EMA5"):
-        df["EMA5"] = compute_EMA(df["Close"], 5)
-    if indicators.get("EMA100"):
-        df["EMA100"] = compute_EMA(df["Close"], 100)
-    if indicators.get("SMA5"):
-        df["SMA5"] = compute_SMA(df["Close"], 5)
-    if indicators.get("SMA100"):
-        df["SMA100"] = compute_SMA(df["Close"], 100)
-    if indicators.get("RSI"):
-        df["RSI"] = compute_RSI(df["Close"], 14)
-    if indicators.get("MACD"):
-        df["MACD"], df["MACD_signal"] = compute_MACD(df["Close"])
-    if indicators.get("PSAR"):
-        df["PSAR"] = compute_PSAR(df["High"], df["Low"], df["Close"])
-    if indicators.get("ROC"):
-        df["ROC"] = compute_ROC(df["Close"], period=12)
+def compute_indicators(df):
+    """
+    Compute all technical indicators (always include all indicators)
+    """
+    # Bollinger Bands
+    df["BB_upper"], df["BB_lower"] = compute_Bollinger_Bands(df["Close"])
+    
+    # Moving Averages
+    df["EMA5"] = compute_EMA(df["Close"], 5)
+    df["EMA100"] = compute_EMA(df["Close"], 100)
+    df["SMA5"] = compute_SMA(df["Close"], 5)
+    df["SMA100"] = compute_SMA(df["Close"], 100)
+    
+    # Oscillators
+    df["RSI"] = compute_RSI(df["Close"], 14)
+    df["MACD"], df["MACD_signal"] = compute_MACD(df["Close"])
+    
+    # Other indicators
+    df["PSAR"] = compute_PSAR(df["High"], df["Low"], df["Close"])
+    df["ROC"] = compute_ROC(df["Close"], period=12)
+    
     df.dropna(inplace=True)
     return df
 
@@ -151,27 +152,21 @@ def prepare_ml_data(df, lookahead):
     df.dropna(inplace=True)
     return df
 
-def select_features(df, indicators):
-    feature_cols = []
-    if indicators.get("Bollinger"):
-        feature_cols.extend(["BB_upper", "BB_lower"])
-    if indicators.get("EMA5"):
-        feature_cols.append("EMA5")
-    if indicators.get("EMA100"):
-        feature_cols.append("EMA100")
-    if indicators.get("SMA5"):
-        feature_cols.append("SMA5")
-    if indicators.get("SMA100"):
-        feature_cols.append("SMA100")
-    if indicators.get("RSI"):
-        feature_cols.append("RSI")
-    if indicators.get("MACD"):
-        feature_cols.extend(["MACD", "MACD_signal"])
-    if indicators.get("PSAR"):
-        feature_cols.append("PSAR")
-    if indicators.get("ROC"):
-        feature_cols.append("ROC")
-    feature_cols.append("Close")
+def select_features(df):
+    """
+    Get all features from the dataframe
+    """
+    # Define all feature columns
+    feature_cols = [
+        "BB_upper", "BB_lower",
+        "EMA5", "EMA100",
+        "SMA5", "SMA100", 
+        "RSI",
+        "MACD", "MACD_signal",
+        "PSAR",
+        "ROC",
+        "Close"
+    ]
     
     X = df[feature_cols]
     y = df["Target"]
@@ -182,23 +177,54 @@ def select_features(df, indicators):
 # ---------------------------
 def select_optimal_features(X_train, y_train, feature_names):
     """
-    Perform feature selection based on importance to reduce dimensionality
-    and minimize overfitting.
+    Perform feature selection with indicator groups treated as single features.
+    This ensures we always select exactly 5 distinct indicators.
     """
-    # Train a basic model
+    # Define indicator groups
+    indicator_groups = {
+        "EMA": ["EMA5", "EMA100"],  # Treated as one feature
+        "SMA": ["SMA5", "SMA100"],  # Treated as one feature
+        "BB": ["BB_upper", "BB_lower"],  # Keeping Bollinger Bands together
+        "MACD_Group": ["MACD", "MACD_signal"]  # Keeping MACD signals together
+    }
+    
+    # Individual indicators
+    single_indicators = ["RSI", "PSAR", "ROC", "Close"]
+    
+    # Train a basic model to get feature importances
     model = XGBClassifier(n_estimators=100, learning_rate=0.05, eval_metric="logloss")
     model.fit(X_train, y_train)
     
     # Get feature importances
     importances = model.feature_importances_
-    indices = np.argsort(importances)[::-1]
+    raw_importance = dict(zip(feature_names, importances))
     
-    # Keep only the top 5 features to reduce overfitting
-    top_n = min(5, len(feature_names))
-    selected_indices = indices[:top_n]
-    selected_features = [feature_names[i] for i in selected_indices]
+    # Calculate group importances by averaging members
+    group_importances = {}
+    for group_name, features in indicator_groups.items():
+        # Check if all features in the group are available
+        if all(f in feature_names for f in features):
+            avg_importance = sum(raw_importance[f] for f in features) / len(features)
+            group_importances[group_name] = (features, avg_importance)
     
-    return selected_features, model
+    # Create single features list
+    individual_importances = {f: ([f], raw_importance[f]) for f in single_indicators if f in feature_names}
+    
+    # Combine all groups and individuals
+    all_feature_groups = {**group_importances, **individual_importances}
+    
+    # Sort by importance
+    sorted_groups = sorted(all_feature_groups.items(), key=lambda x: x[1][1], reverse=True)
+    
+    # Select top 5 groups
+    selected_names = []
+    selected_features = []
+    for i, (name, (features, _)) in enumerate(sorted_groups):
+        if i < 5:  # Only take top 5 groups
+            selected_names.append(name)
+            selected_features.extend(features)
+    
+    return selected_features, selected_names, model
 
 def standardize_features(X_train, X_test=None):
     """
@@ -247,20 +273,54 @@ def train_robust_model(X_train, y_train):
     
     return model.best_estimator_
 
-def plot_feature_importance(model, feature_names):
-    importance = model.feature_importances_
-    fi_df = pd.DataFrame({"Feature": feature_names, "Importance": importance})
+def plot_feature_importance(model, feature_names, selected_groups):
+    """
+    Plot feature importance with grouped indicators shown as single entries
+    """
+    # Get raw feature importances
+    importances = model.feature_importances_
+    
+    # Map to original feature names
+    raw_importance = dict(zip(feature_names, importances))
+    
+    # Define groups for display
+    indicator_groups = {
+        "EMA": ["EMA5", "EMA100"],
+        "SMA": ["SMA5", "SMA100"],
+        "BB": ["BB_upper", "BB_lower"],
+        "MACD_Group": ["MACD", "MACD_signal"]
+    }
+    
+    # Calculate average importance for each selected group
+    display_importance = []
+    for group_name in selected_groups:
+        # If this is a group name
+        if group_name in indicator_groups:
+            features = indicator_groups[group_name]
+            # Calculate average importance
+            group_features = [f for f in features if f in raw_importance]
+            if group_features:
+                avg_importance = sum(raw_importance[f] for f in group_features) / len(group_features)
+                display_importance.append({"Feature": group_name, "Importance": avg_importance})
+        else:
+            # This is an individual feature
+            if group_name in raw_importance:
+                display_importance.append({"Feature": group_name, "Importance": raw_importance[group_name]})
+    
+    # Convert to DataFrame
+    fi_df = pd.DataFrame(display_importance)
     fi_df = fi_df.sort_values(by="Importance", ascending=False)
     
+    # Create plot
     fig, ax = plt.subplots()
     sns.barplot(data=fi_df, x="Importance", y="Feature", ax=ax)
-    ax.set_title("Indicator Importance")
+    ax.set_title("Indicator Group Importance")
     return fig
 
 # ---------------------------
 # WALK-FORWARD BACKTESTING
 # ---------------------------
-def walk_forward_backtest_strategy(df, indicators, feature_cols, initial_balance=10000, retrain_freq=20):
+def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retrain_freq=20):
     """
     Perform walk-forward backtesting with reduced overfitting risk.
     We retrain the model less frequently and use anti-overfitting measures.
@@ -277,6 +337,7 @@ def walk_forward_backtest_strategy(df, indicators, feature_cols, initial_balance
     model = None
     scaler = None
     selected_features = None
+    selected_groups = None
     
     for idx in range(train_window, len(df)):
         current_step = idx - train_window
@@ -284,11 +345,11 @@ def walk_forward_backtest_strategy(df, indicators, feature_cols, initial_balance
         # Retrain model periodically instead of every day to reduce overfitting
         if current_step % retrain_freq == 0 or model is None:
             df_train = df.iloc[:idx]
-            X_train, y_train, _ = select_features(df_train, indicators)
+            X_train, y_train, _ = select_features(df_train)
             
             # Apply feature selection to reduce dimensionality
             if selected_features is None:
-                selected_features, _ = select_optimal_features(X_train, y_train, feature_cols)
+                selected_features, selected_groups, _ = select_optimal_features(X_train, y_train, feature_cols)
             
             # Use only selected features
             X_train = X_train[selected_features]
@@ -302,7 +363,7 @@ def walk_forward_backtest_strategy(df, indicators, feature_cols, initial_balance
         
         # Make prediction for current step
         test_row = df.iloc[idx:idx+1]
-        X_test, _, _ = select_features(test_row, indicators)
+        X_test, _, _ = select_features(test_row)
         
         # Apply same feature selection
         X_test = X_test[selected_features]
@@ -319,7 +380,7 @@ def walk_forward_backtest_strategy(df, indicators, feature_cols, initial_balance
         action = None
 
         if prediction == 1 and position == 0:
-            shares_to_buy = int(balance // current_price)
+            shares_to_buy = int(balance //current_price)
             if shares_to_buy > 0:
                 position = shares_to_buy
                 balance -= shares_to_buy * current_price
@@ -427,7 +488,7 @@ def walk_forward_backtest_strategy(df, indicators, feature_cols, initial_balance
     random_df = pd.DataFrame(random_values)
     random_df["Date"] = pd.to_datetime(random_df["Date"])
 
-    return trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, model
+    return trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, selected_groups, model
 
 # ---------------------------
 # EMH ANALYSIS FUNCTIONS
@@ -449,51 +510,19 @@ def evaluate_emh_compliance(portfolio_df, buy_hold_df, random_df):
     max_drawdown = calculate_max_drawdown(portfolio_df['Portfolio Value'])
     
     # Perform statistical tests
-    # 1. Are returns statistically different from zero? (EMH prediction)
-    t_stat, p_value_t = stats.ttest_1samp(strategy_returns, 0)
-    
-    # 2. Is strategy better than buy & hold?
+    # Is strategy better than buy & hold?
     u_stat_bh, p_value_bh = stats.mannwhitneyu(strategy_returns, bh_returns, alternative='greater')
     
-    # 3. Is strategy better than random trading?
+    # Is strategy better than random trading?
     u_stat_random, p_value_random = stats.mannwhitneyu(strategy_returns, random_returns, alternative='greater')
-    
-    # 4. Test for randomness (runs test)
-    runs, p_value_runs = runs_test(strategy_returns)
     
     return {
         'sharpe_ratio': sharpe_ratio,
         'sortino_ratio': sortino_ratio,
         'max_drawdown': max_drawdown,
-        't_stat': t_stat,
-        'p_value_t': p_value_t,
         'p_value_bh': p_value_bh,
-        'p_value_random': p_value_random,
-        'runs_test_p': p_value_runs
+        'p_value_random': p_value_random
     }
-
-def runs_test(returns):
-    # Convert returns to binary sequence (up or down)
-    binary_seq = np.array([1 if r > 0 else 0 for r in returns])
-    
-    # Count runs
-    n1 = sum(binary_seq)
-    n0 = len(binary_seq) - n1
-    
-    # Count runs
-    runs = 1
-    for i in range(1, len(binary_seq)):
-        if binary_seq[i] != binary_seq[i-1]:
-            runs += 1
-    
-    # Calculate expected runs under randomness
-    expected_runs = ((2 * n1 * n0) / (n1 + n0)) + 1
-    std_runs = np.sqrt((2 * n1 * n0 * (2 * n1 * n0 - n1 - n0)) / ((n1 + n0)**2 * (n1 + n0 - 1)))
-    
-    z = (runs - expected_runs) / std_runs
-    p_value = 2 * (1 - stats.norm.cdf(abs(z)))  # Two-tailed test
-    
-    return runs, p_value
 
 def calculate_max_drawdown(equity_curve):
     running_max = np.maximum.accumulate(equity_curve)
@@ -519,26 +548,13 @@ def main():
     # Add info about anti-overfitting measures
     with st.sidebar.expander("Anti-Overfitting Measures"):
         st.markdown("""
-        - Automatic feature selection (top 5 features)
+        - Automatic selection of the 5 most important indicator groups
+        - Treats related indicators as single groups (EMA5/EMA100, SMA5/SMA100, etc.)
         - Data standardization
         - Regularization (L1 & L2)
         - Less frequent model retraining
         - Cross-validation with time series splits
         """)
-    
-    # Technical indicators selection
-    st.sidebar.subheader("Technical Indicators")
-    indicators = {
-        "Bollinger": st.sidebar.checkbox("Bollinger Bands", value=True),
-        "EMA5": st.sidebar.checkbox("EMA (5-day)", value=True),
-        "EMA100": st.sidebar.checkbox("EMA (100-day)", value=True),
-        "SMA5": st.sidebar.checkbox("SMA (5-day)", value=True),
-        "SMA100": st.sidebar.checkbox("SMA (100-day)", value=True),
-        "RSI": st.sidebar.checkbox("RSI", value=True),
-        "MACD": st.sidebar.checkbox("MACD", value=True),
-        "PSAR": st.sidebar.checkbox("PSAR", value=True),
-        "ROC": st.sidebar.checkbox("ROC", value=True)
-    }
     
     if ticker and start_date and end_date:
         with st.spinner("Processing data..."):
@@ -549,16 +565,16 @@ def main():
                 return
                 
             df["Date"] = pd.to_datetime(df["Date"])
-            df = compute_indicators(df, indicators)
+            df = compute_indicators(df)  # Always compute all indicators
             df_ml = prepare_ml_data(df, lookahead)
             
             # Feature selection and model training
-            X, y, feature_cols = select_features(df_ml, indicators)
+            X, y, feature_cols = select_features(df_ml)
             
             # Run backtesting with anti-overfitting measures
-            with st.spinner("Running strategy simulation with anti-overfitting measures..."):
-                trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, model = walk_forward_backtest_strategy(
-                    df_ml, indicators, feature_cols, initial_capital, retrain_freq=20
+            with st.spinner("Running strategy simulation..."):
+                trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, selected_groups, model = walk_forward_backtest_strategy(
+                    df_ml, feature_cols, initial_capital, retrain_freq=20
                 )
                 
                 # Calculate returns for all strategies
@@ -590,13 +606,13 @@ def main():
                              delta=f"{strategy_return - random_return:.2f}%")
                 
                 # Display selected features
-                st.subheader("Optimally Selected Features")
-                st.write("To reduce overfitting, only these top features were used:")
-                st.write(selected_features)
+                st.subheader("Selected Indicator Groups")
+                st.write("The model selected these 5 indicator groups for trading decisions:")
+                st.write(selected_groups)
                 
-                # Display feature importance
+                # Display feature importance with grouped features
                 if model is not None and selected_features is not None:
-                    st.pyplot(plot_feature_importance(model, selected_features))
+                    st.pyplot(plot_feature_importance(model, selected_features, selected_groups))
                 
                 # Performance chart
                 st.subheader("Performance Comparison")
@@ -635,32 +651,49 @@ def main():
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric("Sharpe Ratio", f"{emh_stats['sharpe_ratio']:.2f}")
+                with col2:
                     st.metric("Max Drawdown", f"{emh_stats['max_drawdown']*100:.2f}%")
                 
-                with col2:
-                    alpha = 0.05
-                    t_test_result = "Reject EMH" if emh_stats['p_value_t'] < alpha else "Cannot reject EMH"
-                    st.metric("Returns ≠ 0 (p-value)", f"{emh_stats['p_value_t']:.4f}", delta=t_test_result)
-                    
                 # Key EMH comparisons
                 st.subheader("Statistical Tests")
                 col1, col2 = st.columns(2)
                 
+                alpha = 0.05
                 with col1:
                     bh_test_result = "Strategy > Buy & Hold" if emh_stats['p_value_bh'] < alpha else "Not better than Buy & Hold"
-                    st.metric("vs Buy & Hold (p-value)", f"{emh_stats['p_value_bh']:.4f}", delta=bh_test_result)
+                    st.metric("vs Buy & Hold", f"{emh_stats['p_value_bh']:.4f}", delta=bh_test_result)
                 
                 with col2:
                     random_test_result = "Strategy > Random" if emh_stats['p_value_random'] < alpha else "Not better than Random"
-                    st.metric("vs Random Trading (p-value)", f"{emh_stats['p_value_random']:.4f}", delta=random_test_result)
+                    st.metric("vs Random Trading", f"{emh_stats['p_value_random']:.4f}", delta=random_test_result)
                 
                 # Overall EMH conclusion
-                if emh_stats['p_value_t'] < alpha and emh_stats['p_value_random'] < alpha:
+                if emh_stats['p_value_random'] < alpha:
                     st.success("🚫 Your strategy shows evidence against the weak form of EMH!")
-                elif emh_stats['p_value_t'] < 0.1 and emh_stats['p_value_random'] < 0.1:
+                elif emh_stats['p_value_random'] < 0.1:
                     st.info("⚠️ Your strategy shows some evidence against EMH, but it's not strongly conclusive.")
                 else:
                     st.warning("✅ Your strategy does not provide evidence against EMH. Results are consistent with market efficiency.")
+                
+                # Add interpretation guidance
+                with st.expander("How to Interpret These Metrics"):
+                    st.markdown("""
+                    ### Performance Metrics
+                    - **Sharpe Ratio**: Measures excess return per unit of risk. Values >1 are good, >2 are very good, >3 are excellent.
+                    - **Max Drawdown**: Shows the largest loss from a peak. Lower values indicate less downside risk during adverse periods.
+                    
+                    ### Statistical Tests
+                    - **vs Buy & Hold**: Mann-Whitney U test. Tests if strategy returns are greater than buy & hold returns.
+                    - **vs Random Trading**: Mann-Whitney U test. Tests if strategy returns are greater than random trading returns.
+                    
+                    ### P-value Interpretation
+                    - **P-value < 0.05**: Strong statistical evidence (95% confidence)
+                    - **P-value < 0.10**: Moderate statistical evidence (90% confidence)
+                    - **P-value > 0.10**: Insufficient statistical evidence
+                    
+                    ### EMH Testing Criteria
+                    To reject the weak form of EMH, we need statistically significant evidence that our TA-based strategy can outperform random trading.
+                    """)
     else:
         st.info("Please provide a stock ticker and date range to analyze.")
 
