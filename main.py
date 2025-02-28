@@ -320,10 +320,23 @@ def plot_feature_importance(model, feature_names, selected_groups):
 # ---------------------------
 # WALK-FORWARD BACKTESTING
 # ---------------------------
-def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retrain_freq=20):
+def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retrain_freq=20, fractional_shares=False):
     """
     Perform walk-forward backtesting with reduced overfitting risk.
     We retrain the model less frequently and use anti-overfitting measures.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The dataframe with technical indicators and target labels
+    feature_cols : list
+        List of feature column names
+    initial_balance : float
+        Starting capital for the backtest
+    retrain_freq : int
+        How often to retrain the model (in days)
+    fractional_shares : bool
+        Whether to allow buying fractional shares (needed for cryptocurrencies)
     """
     balance = initial_balance
     position = 0
@@ -380,18 +393,35 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
         action = None
 
         if prediction == 1 and position == 0:
-            shares_to_buy = int(balance //current_price)
-            if shares_to_buy > 0:
-                position = shares_to_buy
-                balance -= shares_to_buy * current_price
-                action = "BUY"
-                trade_log.append({
-                    "Date": date,
-                    "Action": action,
-                    "Price": current_price,
-                    "Shares": shares_to_buy,
-                    "Portfolio Value": balance + position * current_price
-                })
+            # Modified to handle fractional shares for crypto
+            if fractional_shares:
+                # Use 95% of balance to leave room for potential price fluctuations
+                shares_to_buy = (balance * 0.95) / current_price
+                if shares_to_buy > 0.001:  # Minimum meaningful amount for crypto
+                    position = shares_to_buy
+                    balance -= shares_to_buy * current_price
+                    action = "BUY"
+                    trade_log.append({
+                        "Date": date,
+                        "Action": action,
+                        "Price": current_price,
+                        "Shares": position,
+                        "Portfolio Value": balance + position * current_price
+                    })
+            else:
+                # Original logic for stocks
+                shares_to_buy = int(balance // current_price)
+                if shares_to_buy > 0:
+                    position = shares_to_buy
+                    balance -= shares_to_buy * current_price
+                    action = "BUY"
+                    trade_log.append({
+                        "Date": date,
+                        "Action": action,
+                        "Price": current_price,
+                        "Shares": shares_to_buy,
+                        "Portfolio Value": balance + position * current_price
+                    })
         elif prediction == 0 and position > 0:
             balance += position * current_price
             action = "SELL"
@@ -434,7 +464,13 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
     # --- Buy & Hold Simulation ---
     first_test_row = df.iloc[train_window]
     initial_price = get_float(first_test_row["Close"])
-    shares_bought = int(initial_balance // initial_price)
+    
+    # Fractional shares for buy and hold too
+    if fractional_shares:
+        shares_bought = initial_balance / initial_price
+    else:
+        shares_bought = int(initial_balance // initial_price)
+        
     cash_left = initial_balance - shares_bought * initial_price
 
     buy_hold_values = []
@@ -465,10 +501,16 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
         price = get_float(df.iloc[train_window + idx]["Close"])
         
         if signal == 1 and random_position == 0:  # Buy signal
-            shares_to_buy = int(random_balance // price)
-            if shares_to_buy > 0:
-                random_position = shares_to_buy
-                random_balance -= shares_to_buy * price
+            if fractional_shares:
+                shares_to_buy = (random_balance * 0.95) / price
+                if shares_to_buy > 0.001:
+                    random_position = shares_to_buy
+                    random_balance -= shares_to_buy * price
+            else:
+                shares_to_buy = int(random_balance // price)
+                if shares_to_buy > 0:
+                    random_position = shares_to_buy
+                    random_balance -= shares_to_buy * price
         elif signal == 0 and random_position > 0:  # Sell signal
             random_balance += random_position * price
             random_position = 0
@@ -489,7 +531,6 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
     random_df["Date"] = pd.to_datetime(random_df["Date"])
 
     return trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, selected_groups, model
-
 # ---------------------------
 # EMH ANALYSIS FUNCTIONS
 # ---------------------------
@@ -545,6 +586,12 @@ def main():
     start_date = st.sidebar.date_input("Start Date", value=datetime.date(2020, 1, 1))
     end_date = st.sidebar.date_input("End Date", value=datetime.date.today())
     
+    # Detect if it's a cryptocurrency ticker
+    is_crypto = '-' in ticker or any(crypto in ticker for crypto in ['BTC', 'ETH', 'USDT', 'BNB', 'XRP'])
+    
+    if is_crypto:
+        st.sidebar.info(f"Detected cryptocurrency: {ticker}. Enabling fractional shares.")
+    
     # Add info about anti-overfitting measures
     with st.sidebar.expander("Anti-Overfitting Measures"):
         st.markdown("""
@@ -574,7 +621,7 @@ def main():
             # Run backtesting with anti-overfitting measures
             with st.spinner("Running strategy simulation..."):
                 trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, selected_groups, model = walk_forward_backtest_strategy(
-                    df_ml, feature_cols, initial_capital, retrain_freq=20
+                    df_ml, feature_cols, initial_capital, retrain_freq=20, fractional_shares=is_crypto
                 )
                 
                 # Calculate returns for all strategies
