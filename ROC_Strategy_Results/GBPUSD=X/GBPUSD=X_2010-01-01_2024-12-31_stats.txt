@@ -1,0 +1,3 @@
+Sharpe Ratio: -0.0320
+T-Test Statistic: -1.0103, P-Value: 0.3124
+❌ ROC strategy does not significantly outperform random trading.
