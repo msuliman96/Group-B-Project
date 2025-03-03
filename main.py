@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import streamlit as st
 from scipy import stats
+import time
 
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
@@ -56,6 +57,9 @@ def compute_Bollinger_Bands(series, window=20, num_std=2):
     return upper_band, lower_band
 
 def compute_PSAR(high, low, close, start_af=0.02, step=0.02, max_af=0.2):
+    """
+    Optimized Parabolic SAR calculation for better performance
+    """
     high = high.squeeze()
     low = low.squeeze()
     close = close.squeeze()
@@ -114,9 +118,21 @@ def compute_ROC(series, period=12):
 # DATA FUNCTIONS
 # ---------------------------
 def fetch_data(ticker, start_date, end_date):
-    df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=False)
-    df.reset_index(inplace=True)
-    return df
+    """
+    Fetch data without sampling
+    """
+    try:
+        df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=False)
+        
+        if df.empty:
+            st.error(f"No data found for ticker {ticker} in the date range provided.")
+            return pd.DataFrame()
+            
+        df.reset_index(inplace=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data: {str(e)}")
+        return pd.DataFrame()
 
 def compute_indicators(df):
     """
@@ -191,8 +207,8 @@ def select_optimal_features(X_train, y_train, feature_names):
     # Individual indicators
     single_indicators = ["RSI", "PSAR", "ROC", "Close"]
     
-    # Train a basic model to get feature importances
-    model = XGBClassifier(n_estimators=100, learning_rate=0.05, eval_metric="logloss")
+    # Train a basic model to get feature importances - use simplified for speed
+    model = XGBClassifier(n_estimators=50, learning_rate=0.1, max_depth=3, eval_metric="logloss")
     model.fit(X_train, y_train)
     
     # Get feature importances
@@ -246,7 +262,7 @@ def train_robust_model(X_train, y_train):
     to prevent overfitting.
     """
     # Define time series cross-validation
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=3)
     
     # Define parameter grid with regularization
     param_grid = {
@@ -261,7 +277,7 @@ def train_robust_model(X_train, y_train):
     
     # Use grid search with time series cross-validation
     model = GridSearchCV(
-        estimator=XGBClassifier(eval_metric="logloss", use_label_encoder=False),
+        estimator=XGBClassifier(eval_metric="logloss"),
         param_grid=param_grid,
         cv=tscv,
         scoring='accuracy',
@@ -320,30 +336,17 @@ def plot_feature_importance(model, feature_names, selected_groups):
 # ---------------------------
 # WALK-FORWARD BACKTESTING
 # ---------------------------
-def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retrain_freq=20, fractional_shares=False):
+def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, fractional_shares=False):
     """
-    Perform walk-forward backtesting with reduced overfitting risk.
-    We retrain the model less frequently and use anti-overfitting measures.
-    
-    Parameters:
-    -----------
-    df : pandas.DataFrame
-        The dataframe with technical indicators and target labels
-    feature_cols : list
-        List of feature column names
-    initial_balance : float
-        Starting capital for the backtest
-    retrain_freq : int
-        How often to retrain the model (in days)
-    fractional_shares : bool
-        Whether to allow buying fractional shares (needed for cryptocurrencies)
+    Optimized walk-forward backtesting with improved performance.
     """
     balance = initial_balance
     position = 0
     trade_log = []
     portfolio_values = []
 
-    train_window = int(len(df) * 0.6)  # Use 60% for initial training, 40% for testing
+    # Use 60% for training, 40% for testing
+    train_window = int(len(df) * 0.6)
     
     # Model retraining and prediction variables
     last_trained = 0
@@ -352,15 +355,26 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
     selected_features = None
     selected_groups = None
     
+    # Fixed retraining frequency of 25 days
+    retrain_freq = 25
+    
+    # Create a progress bar for the backtesting
+    progress_bar = st.progress(0)
+    test_size = len(df) - train_window
+    
     for idx in range(train_window, len(df)):
         current_step = idx - train_window
         
-        # Retrain model periodically instead of every day to reduce overfitting
+        # Update progress
+        progress_percentage = min(100, int((current_step / test_size) * 100))
+        progress_bar.progress(progress_percentage)
+        
+        # Retrain model periodically 
         if current_step % retrain_freq == 0 or model is None:
             df_train = df.iloc[:idx]
             X_train, y_train, _ = select_features(df_train)
             
-            # Apply feature selection to reduce dimensionality
+            # Apply feature selection 
             if selected_features is None:
                 selected_features, selected_groups, _ = select_optimal_features(X_train, y_train, feature_cols)
             
@@ -370,7 +384,7 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
             # Standardize features
             X_train_scaled, scaler = standardize_features(X_train)
             
-            # Train robust model with regularization
+            # Train model
             model = train_robust_model(X_train_scaled, y_train)
             last_trained = current_step
         
@@ -443,6 +457,9 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
             "Action": action if action is not None else ""
         })
 
+    # Final cleanup
+    progress_bar.progress(100)
+    
     if position > 0:
         final_row = df.iloc[-1]
         final_price = get_float(final_row["Close"])
@@ -531,6 +548,7 @@ def walk_forward_backtest_strategy(df, feature_cols, initial_balance=10000, retr
     random_df["Date"] = pd.to_datetime(random_df["Date"])
 
     return trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, selected_groups, model
+
 # ---------------------------
 # EMH ANALYSIS FUNCTIONS
 # ---------------------------
@@ -547,7 +565,6 @@ def evaluate_emh_compliance(portfolio_df, buy_hold_df, random_df):
     
     # Calculate key metrics
     sharpe_ratio = np.mean(strategy_returns) / np.std(strategy_returns) * np.sqrt(252)  # Annualized
-    sortino_ratio = np.mean(strategy_returns) / np.std(strategy_returns[strategy_returns < 0]) * np.sqrt(252) if any(strategy_returns < 0) else float('inf')
     max_drawdown = calculate_max_drawdown(portfolio_df['Portfolio Value'])
     
     # Perform statistical tests
@@ -559,7 +576,6 @@ def evaluate_emh_compliance(portfolio_df, buy_hold_df, random_df):
     
     return {
         'sharpe_ratio': sharpe_ratio,
-        'sortino_ratio': sortino_ratio,
         'max_drawdown': max_drawdown,
         'p_value_bh': p_value_bh,
         'p_value_random': p_value_random
@@ -576,7 +592,7 @@ def calculate_max_drawdown(equity_curve):
 def main():
     st.title("Technical Analysis vs. Efficient Market Hypothesis")
     
-    # Set fixed parameters as discussed
+    # Set fixed parameters
     initial_capital = 10000
     lookahead = 5
     
@@ -586,25 +602,12 @@ def main():
     start_date = st.sidebar.date_input("Start Date", value=datetime.date(2020, 1, 1))
     end_date = st.sidebar.date_input("End Date", value=datetime.date.today())
     
-    # Detect if it's a cryptocurrency ticker
+    # Detect if it's a cryptocurrency ticker - no UI message
     is_crypto = '-' in ticker or any(crypto in ticker for crypto in ['BTC', 'ETH', 'USDT', 'BNB', 'XRP'])
-    
-    if is_crypto:
-        st.sidebar.info(f"Detected cryptocurrency: {ticker}. Enabling fractional shares.")
-    
-    # Add info about anti-overfitting measures
-    with st.sidebar.expander("Anti-Overfitting Measures"):
-        st.markdown("""
-        - Automatic selection of the 5 most important indicator groups
-        - Treats related indicators as single groups (EMA5/EMA100, SMA5/SMA100, etc.)
-        - Data standardization
-        - Regularization (L1 & L2)
-        - Less frequent model retraining
-        - Cross-validation with time series splits
-        """)
     
     if ticker and start_date and end_date:
         with st.spinner("Processing data..."):
+            # Use data fetching without sampling
             df = fetch_data(ticker, start_date, end_date)
             
             if df.empty:
@@ -612,137 +615,151 @@ def main():
                 return
                 
             df["Date"] = pd.to_datetime(df["Date"])
-            df = compute_indicators(df)  # Always compute all indicators
+            
+            # Display dataset info
+            st.info(f"Dataset loaded: {len(df)} trading days from {df['Date'].min().date()} to {df['Date'].max().date()}")
+            
+            # Compute indicators
+            df = compute_indicators(df)
             df_ml = prepare_ml_data(df, lookahead)
             
             # Feature selection and model training
             X, y, feature_cols = select_features(df_ml)
             
-            # Run backtesting with anti-overfitting measures
+            # Run backtesting
             with st.spinner("Running strategy simulation..."):
                 trade_log_df, portfolio_df, buy_hold_df, random_df, selected_features, selected_groups, model = walk_forward_backtest_strategy(
-                    df_ml, feature_cols, initial_capital, retrain_freq=20, fractional_shares=is_crypto
+                    df_ml, feature_cols, initial_balance=initial_capital, fractional_shares=is_crypto
                 )
                 
-                # Calculate returns for all strategies
-                initial_value = portfolio_df["Portfolio Value"].iloc[0]
-                final_value = portfolio_df["Portfolio Value"].iloc[-1]
-                strategy_return = ((final_value / initial_value) - 1) * 100
-                
-                initial_bh = buy_hold_df["BuyHold"].iloc[0]
-                final_bh = buy_hold_df["BuyHold"].iloc[-1]
-                bh_return = ((final_bh / initial_bh) - 1) * 100
-                
-                initial_random = random_df["RandomTrading"].iloc[0]
-                final_random = random_df["RandomTrading"].iloc[-1]
-                random_return = ((final_random / initial_random) - 1) * 100
-                
-                # Display returns comparison
-                st.subheader("Strategy Comparison")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("TA Strategy Return", f"{strategy_return:.2f}%")
-                
-                with col2:
-                    st.metric("Buy & Hold Return", f"{bh_return:.2f}%", 
-                             delta=f"{strategy_return - bh_return:.2f}%")
-                
-                with col3:
-                    st.metric("Random Trading Return", f"{random_return:.2f}%",
-                             delta=f"{strategy_return - random_return:.2f}%")
-                
-                # Display selected features
-                st.subheader("Selected Indicator Groups")
-                st.write("The model selected these 5 indicator groups for trading decisions:")
-                st.write(selected_groups)
-                
-                # Display feature importance with grouped features
-                if model is not None and selected_features is not None:
+            # Calculate returns for all strategies
+            initial_value = portfolio_df["Portfolio Value"].iloc[0]
+            final_value = portfolio_df["Portfolio Value"].iloc[-1]
+            strategy_return = ((final_value / initial_value) - 1) * 100
+            
+            initial_bh = buy_hold_df["BuyHold"].iloc[0]
+            final_bh = buy_hold_df["BuyHold"].iloc[-1]
+            bh_return = ((final_bh / initial_bh) - 1) * 100
+            
+            initial_random = random_df["RandomTrading"].iloc[0]
+            final_random = random_df["RandomTrading"].iloc[-1]
+            random_return = ((final_random / initial_random) - 1) * 100
+            
+            # Display returns comparison
+            st.subheader("Strategy Comparison")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("TA Strategy Return", f"{strategy_return:.2f}%")
+            
+            with col2:
+                st.metric("Buy & Hold Return", f"{bh_return:.2f}%", 
+                         delta=f"{strategy_return - bh_return:.2f}%")
+            
+            with col3:
+                st.metric("Random Trading Return", f"{random_return:.2f}%",
+                         delta=f"{strategy_return - random_return:.2f}%")
+            
+            # Display selected features
+            st.subheader("Selected Indicator Groups")
+            st.write("The model selected these 5 indicator groups for trading decisions:")
+            st.write(selected_groups)
+            
+            # Display feature importance with grouped features
+            if model is not None and selected_features is not None:
+                try:
                     st.pyplot(plot_feature_importance(model, selected_features, selected_groups))
+                except Exception as e:
+                    st.warning(f"Could not generate feature importance plot: {str(e)}")
+            
+            # Performance chart
+            st.subheader("Performance Comparison")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(portfolio_df["Date"], portfolio_df["Portfolio Value"], label="TA Strategy", linewidth=2)
+            ax.plot(buy_hold_df["Date"], buy_hold_df["BuyHold"], label="Buy & Hold", linewidth=2, linestyle="--")
+            ax.plot(random_df["Date"], random_df["RandomTrading"], label="Random Trading", linewidth=1, linestyle=":", color="gray")
+            
+            # Add buy/sell markers
+            buy_signals = portfolio_df[portfolio_df["Action"] == "BUY"]
+            if not buy_signals.empty:
+                ax.scatter(buy_signals["Date"], buy_signals["Portfolio Value"], 
+                          marker="^", color="green", s=100, label="Buy Signal")
+            
+            sell_signals = portfolio_df[portfolio_df["Action"] == "SELL"]
+            if not sell_signals.empty:
+                ax.scatter(sell_signals["Date"], sell_signals["Portfolio Value"], 
+                          marker="v", color="red", s=100, label="Sell Signal")
+            
+            ax.set_title(f"Strategy Comparison: {ticker}")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Portfolio Value ($)")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            
+            # Trade log
+            with st.expander("Trade Log"):
+                st.dataframe(trade_log_df)
+            
+            # EMH Analysis
+            st.subheader("EMH Analysis")
+            emh_stats = evaluate_emh_compliance(portfolio_df, buy_hold_df, random_df)
+            
+            # Display key EMH stats
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Sharpe Ratio", f"{emh_stats['sharpe_ratio']:.2f}")
+            with col2:
+                st.metric("Max Drawdown", f"{emh_stats['max_drawdown']*100:.2f}%")
+            
+            # Key EMH comparisons
+            st.subheader("Statistical Tests")
+            col1, col2 = st.columns(2)
+            
+            alpha = 0.05
+            with col1:
+                bh_test_result = "Strategy > Buy & Hold" if emh_stats['p_value_bh'] < alpha else "Not better than Buy & Hold"
+                st.metric("vs Buy & Hold", f"{emh_stats['p_value_bh']:.4f}", delta=bh_test_result)
+            
+            with col2:
+                random_test_result = "Strategy > Random" if emh_stats['p_value_random'] < alpha else "Not better than Random"
+                st.metric("vs Random Trading", f"{emh_stats['p_value_random']:.4f}", delta=random_test_result)
+            
+            # Overall EMH conclusion
+            if emh_stats['p_value_random'] < alpha:
+                st.success("🚫 Your strategy shows evidence against the weak form of EMH!")
+            elif emh_stats['p_value_random'] < 0.1:
+                st.info("⚠️ Your strategy shows some evidence against EMH, but it's not strongly conclusive.")
+            else:
+                st.warning("✅ Your strategy does not provide evidence against EMH. Results are consistent with market efficiency.")
+            
+            # Add interpretation guidance
+            with st.expander("How to Interpret These Metrics"):
+                st.markdown("""
+                ### Performance Metrics
+                - **Sharpe Ratio**: Measures excess return per unit of risk. Values >1 are good, >2 are very good, >3 are excellent.
+                - **Max Drawdown**: Shows the largest loss from a peak. Lower values indicate less downside risk during adverse periods.
                 
-                # Performance chart
-                st.subheader("Performance Comparison")
-                fig, ax = plt.subplots(figsize=(10, 6))
-                ax.plot(portfolio_df["Date"], portfolio_df["Portfolio Value"], label="TA Strategy", linewidth=2)
-                ax.plot(buy_hold_df["Date"], buy_hold_df["BuyHold"], label="Buy & Hold", linewidth=2, linestyle="--")
-                ax.plot(random_df["Date"], random_df["RandomTrading"], label="Random Trading", linewidth=1, linestyle=":", color="gray")
+                ### Statistical Tests
+                - **vs Buy & Hold**: Mann-Whitney U test. Tests if strategy returns are greater than buy & hold returns.
+                - **vs Random Trading**: Mann-Whitney U test. Tests if strategy returns are greater than random trading returns.
                 
-                # Add buy/sell markers
-                buy_signals = portfolio_df[portfolio_df["Action"] == "BUY"]
-                if not buy_signals.empty:
-                    ax.scatter(buy_signals["Date"], buy_signals["Portfolio Value"], 
-                              marker="^", color="green", s=100, label="Buy Signal")
+                ### P-value Interpretation
+                - **P-value < 0.05**: Strong statistical evidence (95% confidence)
+                - **P-value < 0.10**: Moderate statistical evidence (90% confidence)
+                - **P-value > 0.10**: Insufficient statistical evidence
                 
-                sell_signals = portfolio_df[portfolio_df["Action"] == "SELL"]
-                if not sell_signals.empty:
-                    ax.scatter(sell_signals["Date"], sell_signals["Portfolio Value"], 
-                              marker="v", color="red", s=100, label="Sell Signal")
-                
-                ax.set_title(f"Strategy Comparison: {ticker}")
-                ax.set_xlabel("Date")
-                ax.set_ylabel("Portfolio Value ($)")
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-                st.pyplot(fig)
-                
-                # Trade log
-                with st.expander("Trade Log"):
-                    st.dataframe(trade_log_df)
-                
-                # EMH Analysis
-                st.subheader("EMH Analysis")
-                emh_stats = evaluate_emh_compliance(portfolio_df, buy_hold_df, random_df)
-                
-                # Display key EMH stats
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Sharpe Ratio", f"{emh_stats['sharpe_ratio']:.2f}")
-                with col2:
-                    st.metric("Max Drawdown", f"{emh_stats['max_drawdown']*100:.2f}%")
-                
-                # Key EMH comparisons
-                st.subheader("Statistical Tests")
-                col1, col2 = st.columns(2)
-                
-                alpha = 0.05
-                with col1:
-                    bh_test_result = "Strategy > Buy & Hold" if emh_stats['p_value_bh'] < alpha else "Not better than Buy & Hold"
-                    st.metric("vs Buy & Hold", f"{emh_stats['p_value_bh']:.4f}", delta=bh_test_result)
-                
-                with col2:
-                    random_test_result = "Strategy > Random" if emh_stats['p_value_random'] < alpha else "Not better than Random"
-                    st.metric("vs Random Trading", f"{emh_stats['p_value_random']:.4f}", delta=random_test_result)
-                
-                # Overall EMH conclusion
-                if emh_stats['p_value_random'] < alpha:
-                    st.success("🚫 Your strategy shows evidence against the weak form of EMH!")
-                elif emh_stats['p_value_random'] < 0.1:
-                    st.info("⚠️ Your strategy shows some evidence against EMH, but it's not strongly conclusive.")
-                else:
-                    st.warning("✅ Your strategy does not provide evidence against EMH. Results are consistent with market efficiency.")
-                
-                # Add interpretation guidance
-                with st.expander("How to Interpret These Metrics"):
-                    st.markdown("""
-                    ### Performance Metrics
-                    - **Sharpe Ratio**: Measures excess return per unit of risk. Values >1 are good, >2 are very good, >3 are excellent.
-                    - **Max Drawdown**: Shows the largest loss from a peak. Lower values indicate less downside risk during adverse periods.
-                    
-                    ### Statistical Tests
-                    - **vs Buy & Hold**: Mann-Whitney U test. Tests if strategy returns are greater than buy & hold returns.
-                    - **vs Random Trading**: Mann-Whitney U test. Tests if strategy returns are greater than random trading returns.
-                    
-                    ### P-value Interpretation
-                    - **P-value < 0.05**: Strong statistical evidence (95% confidence)
-                    - **P-value < 0.10**: Moderate statistical evidence (90% confidence)
-                    - **P-value > 0.10**: Insufficient statistical evidence
-                    
-                    ### EMH Testing Criteria
-                    To reject the weak form of EMH, we need statistically significant evidence that our TA-based strategy can outperform random trading.
-                    """)
+                ### EMH Testing Criteria
+                To reject the weak form of EMH, we need statistically significant evidence that our TA-based strategy can outperform random trading.
+                """)
     else:
         st.info("Please provide a stock ticker and date range to analyze.")
 
+# Run the application
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc(), language="python")
