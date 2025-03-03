@@ -1,0 +1,3 @@
+Sharpe Ratio: 0.0025
+T-Test Statistic: 0.4843, P-Value: 0.6282
+❌ RSI strategy does not significantly outperform random trading.
