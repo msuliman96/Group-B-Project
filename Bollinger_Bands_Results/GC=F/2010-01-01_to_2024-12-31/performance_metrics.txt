@@ -1,0 +1,3 @@
+Sharpe Ratio: -0.0236
+T-Test Statistic: -0.6015, P-Value: 0.5476
+❌ Not Significant.

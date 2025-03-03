@@ -1,0 +1,3 @@
+Sharpe Ratio: -0.0051
+T-Test Statistic: 0.1261, P-Value: 0.8997
+❌ SMA strategy does not significantly outperform random trading.
